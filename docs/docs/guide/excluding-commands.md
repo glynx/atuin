@@ -125,7 +125,8 @@ sensitive_files = [
 
 Atuin replaces the credentials it recognises with `****` in captured output and
 AI sessions. If you have secrets in a format it doesn't know, such as internal
-tokens, give it their pattern:
+tokens, give it their pattern. Your patterns apply to the commands in your
+history too:
 
 ```toml
 [security]
@@ -135,8 +136,20 @@ redact_patterns = [
 ]
 ```
 
+A command full of `****` is hard to reuse, so a pattern can bring its own
+replacement, such as a placeholder or a shell variable to fill in next time:
+
+```toml
+[security]
+redact_patterns = [
+    { pattern = '(--password=)\S+', replacement = '${1}<PASSWORD>' },
+    { pattern = '(\s-p\s+)\S+', replacement = '${1}$$PASS' },  # `$$` is a literal `$`
+]
+```
+
 Redaction replaces the value and keeps the text around it. To keep a whole
-command out instead, use [`history_filter`](#commands-history_filter).
+command out instead, use [`history_filter`](#commands-history_filter). See
+[`redact_patterns`](../configuration/config.md#redact_patterns) for the details.
 
 ## AI agents' tool calls: `capture_tools`
 
@@ -178,7 +191,9 @@ Without any of the settings above, Atuin:
 - **doesn't record commands containing a credential** it recognises, such as
   AWS, GitHub, OpenAI or Anthropic keys, while
   [`secrets_filter`](../configuration/config.md#secrets_filter) is on (the
-  default). It also leaves those commands out of AI sessions.
+  default), unless one of your own
+  [`redact_patterns`](#your-own-secrets-redact_patterns) replaces it. It also
+  leaves those commands out of AI sessions.
 - **redacts credentials in captured output and AI sessions**, replacing them
   with `****`: the same formats, plus private keys, passwords in connection
   strings, and values assigned to names like `DB_PASSWORD` or `api_key`.

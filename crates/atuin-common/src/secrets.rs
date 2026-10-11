@@ -647,8 +647,10 @@ fn redact_once<'a>(
             spans.extend(table.spans(i, s).filter(|span| !is_multiline_opener(&s[span.clone()])));
         }
     }
-    // The user's own: the `secret` group where one names it, else the whole match.
-    for regex in &redactor.extra {
+    // The user's own: the `secret` group where one names it, else the whole match. Those with a
+    // replacement of their own have already run (see `Redactor::redact_by`).
+    for regex in redactor.extra.iter().filter(|pattern| pattern.replacement.is_none()) {
+        let regex = &regex.regex;
         if late() {
             return Err(TooSlow);
         }
@@ -709,11 +711,118 @@ pub const REDACT_BUDGET: Duration = if cfg!(debug_assertions) {
     Duration::from_millis(250)
 };
 
-/// [`redact`], taking out what the user's own patterns (`[security] redact_patterns`) match too:
-/// a pattern's `secret` group where it names one, else all it matches.
+/// One of the user's own patterns (`[security] redact_patterns`).
+///
+/// Without a replacement, what it finds becomes [`REDACTED`]: its `secret` group where it names
+/// one, else all it matches. With one, all it matches becomes that replacement, in which `$1`,
+/// `${1}` and `${name}` are what the pattern's groups captured and `$$` is a literal `$` -- the
+/// syntax of [`Regex::replace_all`]. Keeping text around the value is then up to the groups:
+/// `(--password=)\S+` with `${1}<PASSWORD>`.
+#[derive(Clone, Debug)]
+pub struct RedactPattern {
+    regex: Regex,
+    replacement: Option<String>,
+}
+
+/// A replacement naming a group its pattern doesn't have, which [`Regex::replace_all`] would
+/// silently expand to nothing: most often a `$` meant literally, as in `$TARGET`.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "the replacement refers to group `{group}`, which the pattern does not have (write `$$` for a \
+     literal `$`)"
+)]
+pub struct UnknownGroup {
+    pub group: String,
+}
+
+impl RedactPattern {
+    /// A pattern whose matches become [`REDACTED`].
+    #[must_use]
+    pub const fn new(regex: Regex) -> Self {
+        Self {
+            regex,
+            replacement: None,
+        }
+    }
+
+    /// A pattern whose matches become `replacement`, once every group `replacement` refers to is
+    /// one of `regex`'s.
+    ///
+    /// # Errors
+    ///
+    /// [`UnknownGroup`] for the first reference to a group `regex` does not have.
+    pub fn with_replacement(regex: Regex, replacement: String) -> Result<Self, UnknownGroup> {
+        for group in group_references(&replacement) {
+            let known = match group.parse::<usize>() {
+                Ok(index) => index < regex.captures_len(),
+                Err(_) => regex.capture_names().any(|name| name == Some(group)),
+            };
+            if !known {
+                return Err(UnknownGroup {
+                    group: group.to_owned(),
+                });
+            }
+        }
+        Ok(Self {
+            regex,
+            replacement: Some(replacement),
+        })
+    }
+
+    #[must_use]
+    pub const fn regex(&self) -> &Regex {
+        &self.regex
+    }
+
+    #[must_use]
+    pub fn replacement(&self) -> Option<&str> {
+        self.replacement.as_deref()
+    }
+}
+
+impl From<Regex> for RedactPattern {
+    fn from(regex: Regex) -> Self {
+        Self::new(regex)
+    }
+}
+
+/// The groups `replacement` refers to, read as [`Regex::replace_all`] reads them: `$$` is a
+/// literal `$`; `${...}` names whatever is between the braces; otherwise `$` takes the longest
+/// run of ASCII letters, digits and `_` after it. A `$` that starts none of these is literal.
+fn group_references(replacement: &str) -> Vec<&str> {
+    let bytes = replacement.as_bytes();
+    let mut groups = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'$' {
+            i += 1;
+            continue;
+        }
+        let rest = &replacement[i + 1..];
+        if rest.starts_with('$') {
+            i += 2;
+        } else if let Some(braced) = rest.strip_prefix('{')
+            && let Some(end) = braced.find('}')
+        {
+            groups.push(&braced[..end]);
+            i += 1 + 1 + end + 1;
+        } else {
+            let len = rest.bytes().take_while(|b| b.is_ascii_alphanumeric() || *b == b'_').count();
+            if len > 0 {
+                groups.push(&rest[..len]);
+            }
+            i += 1 + len;
+        }
+    }
+    groups
+}
+
+/// [`redact`], with the user's own patterns (`[security] redact_patterns`) too: first those with a
+/// replacement, each in turn over the whole text, in the order given; then, alongside the built-in
+/// ones, the others.
 #[derive(Clone, Debug)]
 pub struct Redactor {
-    extra: Vec<Regex>,
+    extra: Vec<RedactPattern>,
     /// Whether the built-in patterns apply (`secrets_filter`), or only `extra`.
     builtin: bool,
 }
@@ -726,7 +835,7 @@ impl Default for Redactor {
 
 impl Redactor {
     #[must_use]
-    pub const fn new(extra: Vec<Regex>, builtin: bool) -> Self {
+    pub const fn new(extra: Vec<RedactPattern>, builtin: bool) -> Self {
         Self { extra, builtin }
     }
 
@@ -761,9 +870,33 @@ impl Redactor {
         if !self.is_active() {
             return Ok(Cow::Borrowed(s));
         }
-        let mut out = match redact_once(s, self, deadline)? {
-            Cow::Borrowed(_) => return Ok(Cow::Borrowed(s)),
-            Cow::Owned(out) => out,
+
+        // The user's replacements, each in turn, so that one can build on what another left. A
+        // pass is all each gets: what one writes may well match it again (`<PASSWORD>`), and so
+        // would be rewritten without end.
+        let mut replaced: Option<String> = None;
+        for pattern in &self.extra {
+            let Some(replacement) = pattern.replacement.as_deref() else {
+                continue;
+            };
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                return Err(TooSlow);
+            }
+            let current = replaced.as_deref().unwrap_or(s);
+            let next = match pattern.regex.replace_all(current, replacement) {
+                Cow::Borrowed(_) => continue,
+                Cow::Owned(next) => next,
+            };
+            replaced = Some(next);
+        }
+        // A replacement can write back exactly what it matched; that is not a change.
+        let replaced = replaced.filter(|replaced| replaced != s);
+
+        let Some(mut out) = (match redact_once(replaced.as_deref().unwrap_or(s), self, deadline)? {
+            Cow::Borrowed(_) => replaced,
+            Cow::Owned(out) => Some(out),
+        }) else {
+            return Ok(Cow::Borrowed(s));
         };
 
         // Two patterns can carve one stretch into spans whose leftovers a second pass captures
@@ -796,12 +929,12 @@ mod tests {
     use std::sync::LazyLock;
 
     use proptest::prelude::*;
-    use regex::RegexSet;
+    use regex::{Regex, RegexSet};
     use rstest::rstest;
 
     use super::{
-        REDACTED, REDACTION, Redactor, SECRET_GROUP, contains_secret, history_patterns,
-        output_unsafe, redact, redaction_patterns, vendors,
+        REDACTED, REDACTION, RedactPattern, Redactor, SECRET_GROUP, contains_secret,
+        history_patterns, output_unsafe, redact, redaction_patterns, vendors,
     };
 
     pub(super) struct Test {
@@ -1600,8 +1733,154 @@ mod tests {
         #[case] input: &str,
         #[case] expected: &str,
     ) {
-        let redactor = Redactor::new(vec![regex::Regex::new(pattern).unwrap()], true);
+        let redactor = Redactor::new(vec![RedactPattern::new(Regex::new(pattern).unwrap())], true);
         assert_eq!(redactor.redact(input), expected);
+    }
+
+    fn replacing(patterns: &[(&str, &str)]) -> Redactor {
+        let patterns = patterns
+            .iter()
+            .map(|(pattern, replacement)| {
+                RedactPattern::with_replacement(
+                    Regex::new(pattern).unwrap(),
+                    (*replacement).to_owned(),
+                )
+                .unwrap()
+            })
+            .collect();
+        Redactor::new(patterns, false)
+    }
+
+    /// A pattern with a replacement rewrites all it matches, every time it matches, with its
+    /// groups expanded.
+    #[rstest]
+    #[case::group(
+        &[(r"(--password=)\S+", "${1}<PASSWORD>")],
+        "mysql --password=hunter2 db",
+        "mysql --password=<PASSWORD> db"
+    )]
+    #[case::named_group(
+        &[(r"(?<flag>-p\s+)\S+", "${flag}<PASSWORD>")],
+        "netexec smb host -p hunter2",
+        "netexec smb host -p <PASSWORD>"
+    )]
+    #[case::every_match(
+        &[(r"(Bearer\s+)[^\s']+", "${1}<TOKEN>")],
+        "curl -H 'Authorization: Bearer abc' -H 'X: Bearer def'",
+        "curl -H 'Authorization: Bearer <TOKEN>' -H 'X: Bearer <TOKEN>'"
+    )]
+    #[case::literal_dollar(
+        &[(r"(-u\s+)\S+", "${1}$$USER")],
+        "netexec smb host -u alice",
+        "netexec smb host -u $USER"
+    )]
+    #[case::dollar_before_nothing(&[("price: \\d+", "price: $")], "price: 42", "price: $")]
+    #[case::two_values_two_patterns(
+        &[(r"(\s-u\s+)\S+", "${1}$$USER"), (r"(\s-p\s+)\S+", "${1}$$PASS")],
+        "netexec smb 192.0.2.10 -u alice -d LAB -p hunter2",
+        "netexec smb 192.0.2.10 -u $USER -d LAB -p $PASS"
+    )]
+    #[case::in_order(&[("alpha", "beta"), ("beta", "gamma")], "alpha beta", "gamma gamma")]
+    #[case::whole_match(&[(r"ACME-[0-9]{6}", "<ACME>")], "id ACME-123456", "id <ACME>")]
+    #[case::unicode(&[(r"(pässwort=)\S+", "${1}<PW>")], "set pässwort=grüße ok", "set pässwort=<PW> ok")]
+    #[case::multiline(
+        &[(r"(?m)^(token:\s*)\S+$", "${1}<TOKEN>")],
+        "cat <<EOF\ntoken: abc\nother: x\nEOF",
+        "cat <<EOF\ntoken: <TOKEN>\nother: x\nEOF"
+    )]
+    #[case::no_match(&[(r"(--password=)\S+", "${1}<PASSWORD>")], "ls -la", "ls -la")]
+    fn replacements_rewrite_what_they_match(
+        #[case] patterns: &[(&str, &str)],
+        #[case] input: &str,
+        #[case] expected: &str,
+    ) {
+        assert_eq!(replacing(patterns).redact(input), expected);
+    }
+
+    /// The limits of `\S+`: the rest of a quoted value remains. The user's patterns are only as good
+    /// as the user makes them; this pins that nothing hides it.
+    #[rstest]
+    fn replacements_do_not_understand_quoting() {
+        let redactor = replacing(&[(r"(\s-p\s+)\S+", "${1}$$PASS")]);
+        assert_eq!(redactor.redact("x -p 'hunter 2'"), "x -p $PASS 2'");
+    }
+
+    /// Running again changes nothing, for patterns that don't match what they write -- what the
+    /// migration of existing history relies on to be repeatable.
+    #[rstest]
+    fn typical_replacements_are_idempotent() {
+        let redactor =
+            replacing(&[(r"(--password=)\S+", "${1}<PASSWORD>"), (r"(\s-u\s+)\S+", "${1}$$USER")]);
+        let once = redactor.redact("x --password=a -u b").into_owned();
+        assert_eq!(redactor.redact(&once), Cow::Borrowed(once.as_str()));
+    }
+
+    /// `Borrowed` still means "nothing changed": a replacement that writes back what it matched
+    /// changed nothing.
+    #[rstest]
+    fn a_replacement_that_changes_nothing_is_not_a_change() {
+        let redactor = replacing(&[(r"(--password=)<PASSWORD>", "${1}<PASSWORD>")]);
+        let input = "x --password=<PASSWORD>";
+        assert!(matches!(redactor.redact(input), Cow::Borrowed(_)));
+    }
+
+    /// Replacements run first, then the plain patterns and the built-in ones see their result.
+    #[rstest]
+    fn replacements_run_before_the_other_patterns() {
+        let patterns = vec![
+            RedactPattern::new(Regex::new(r"<\w+>").unwrap()),
+            RedactPattern::with_replacement(Regex::new(r"(-u )\S+").unwrap(), "${1}<USER>".into())
+                .unwrap(),
+        ];
+        let redactor = Redactor::new(patterns, true);
+        assert_eq!(
+            redactor.redact("x -u alice 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"),
+            "x -u **** ****"
+        );
+    }
+
+    #[rstest]
+    #[case::bare_name("$TARGET", "TARGET")]
+    #[case::braced_name("${TARGET}", "TARGET")]
+    #[case::index_past_the_groups("${2}", "2")]
+    #[case::name_runs_on("$1a", "1a")]
+    #[case::empty_braces("${}", "")]
+    #[case::after_a_literal_dollar("$$$TARGET", "TARGET")]
+    fn replacements_must_refer_to_the_patterns_groups(
+        #[case] replacement: &str,
+        #[case] group: &str,
+    ) {
+        let err = RedactPattern::with_replacement(
+            Regex::new(r"(?<flag>-u )\S+").unwrap(),
+            replacement.to_owned(),
+        )
+        .unwrap_err();
+        assert_eq!(err.group, group);
+    }
+
+    #[rstest]
+    #[case::literal("$$TARGET")]
+    #[case::index("${1}x")]
+    #[case::whole("$0")]
+    #[case::name("${flag}")]
+    #[case::bare_dollar("cost: $")]
+    #[case::dollar_and_punctuation("$-")]
+    #[case::unclosed_brace("${flag")]
+    #[case::no_references("<PASSWORD>")]
+    fn replacements_referring_to_the_patterns_groups_are_accepted(#[case] replacement: &str) {
+        assert!(
+            RedactPattern::with_replacement(
+                Regex::new(r"(?<flag>-u )\S+").unwrap(),
+                replacement.to_owned()
+            )
+            .is_ok()
+        );
+    }
+
+    #[rstest]
+    fn replacements_past_their_budget_give_up() {
+        let redactor = replacing(&[("a", "b")]);
+        assert!(redactor.redact_within("aaa", std::time::Duration::ZERO).is_none());
     }
 
     #[rstest]

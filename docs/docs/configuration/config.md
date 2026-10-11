@@ -1153,8 +1153,8 @@ set to.
 ## Security
 
 Settings under `[security]` add to Atuin's built-in rules for keeping
-credentials out of what it stores: captured command output and
-[AI sessions](../ai/sessions.md#whats-captured). For which setting to reach for,
+credentials out of what it stores: the commands in your history, captured
+command output and [AI sessions](../ai/sessions.md#whats-captured). For which setting to reach for,
 see [Keeping Secrets Out of Atuin](../guide/excluding-commands.md).
 
 ```toml
@@ -1168,9 +1168,9 @@ sensitive_files = []
 Default: `[]`
 
 Regular expressions for credentials of your own, redacted wherever Atuin
-redacts, alongside the [built-in patterns](#secrets_filter). Atuin replaces a
-pattern's `secret` group with `****` if it has one, otherwise everything the
-pattern matches.
+redacts: in the commands your history keeps, in captured command output and in
+AI sessions. Atuin replaces a pattern's `secret` group with `****` if it has
+one, otherwise everything the pattern matches.
 
 ```toml
 [security]
@@ -1179,6 +1179,41 @@ redact_patterns = [
    "internal-api-key: (?<secret>\\S+)",
 ]
 ```
+
+To keep a command readable, and reusable, give a pattern its own replacement.
+Everything the pattern matches is replaced, so capture what should stay in a
+group and write it back: `$1` or `${1}` is a numbered group, `${name}` a named
+one, and `$$` a literal `$`. Single-quoted TOML strings save escaping
+backslashes.
+
+```toml
+[security]
+redact_patterns = [
+   # mysql --password=hunter2 db  ->  mysql --password=<PASSWORD> db
+   { pattern = '(--password=)\S+', replacement = '${1}<PASSWORD>' },
+   # netexec smb host -u alice -p hunter2  ->  netexec smb host -u $USER -p $PASS
+   { pattern = '(\s-u\s+)\S+', replacement = '${1}$$USER' },
+   { pattern = '(\s-p\s+)\S+', replacement = '${1}$$PASS' },
+]
+```
+
+Patterns with a replacement run first, one after the other in the order given,
+each replacing every match; then the others run alongside the built-in
+patterns. A replacement that refers to a group its pattern doesn't have is a
+configuration error rather than an empty string, which is what an unescaped
+`$TARGET` would otherwise become. Each pattern runs once per command, so a
+replacement its own pattern matches again (`<PASSWORD>` above) is not
+rewritten twice. Patterns are the [`regex` crate's
+syntax](https://docs.rs/regex/latest/regex/#syntax): no look-around or
+backreferences, and `^`/`$` match at line breaks only with `(?m)`.
+
+Commands are rewritten before they're stored or synced. The command that runs
+is never changed, and nor is history you already have. Then
+[`history_filter`](#history_filter) is checked against both the command as
+typed and as rewritten, and [`secrets_filter`](#secrets_filter) against the
+rewritten command only: a credential your patterns replace no longer keeps the
+command out. The built-in patterns don't rewrite commands; a command with a
+credential they recognise is still left out.
 
 These patterns don't keep a command out of history; use
 [`history_filter`](#history_filter) for that. When

@@ -408,6 +408,18 @@ fn make_starting_history(
         return None;
     }
 
+    // The user's own patterns rewrite what is kept, before the filters judge it: a secret they
+    // replace no longer keeps the command out (`secrets_filter`), one they don't still does.
+    // `history_filter` was written against what is typed, so it sees that as well, as does the
+    // leading space that keeps a command out.
+    if command.starts_with(' ') || settings.history_filter.is_match(command) {
+        return None;
+    }
+    let Some(command) = settings.security.redact_command(command) else {
+        debug!("dropping a command that took too long to redact");
+        return None;
+    };
+
     // When the flags didn't state an identity, fall back to the one the invoking integration
     // exported to the environment. The env kind only qualifies a stated author: a stray
     // ATUIN_HISTORY_AUTHOR_KIND inherited by a nested interactive shell must not stamp the
@@ -418,7 +430,7 @@ fn make_starting_history(
 
     let h: History = History::capture()
         .timestamp(OffsetDateTime::now_utc())
-        .command(command)
+        .command(command.into_owned())
         .cwd(cwd)
         .author_opt(author)
         .author_kind_opt(author_kind)
@@ -1320,6 +1332,81 @@ mod tests {
         // A command containing a NUL byte can never have been executed by a shell;
         // it should be dropped rather than committed to history.
         assert!(make_starting_history(&settings, "hello\0world", None, None, None).is_none());
+    }
+
+    fn redacting(patterns: &[(&str, &str)]) -> Settings {
+        use atuin_client::settings::Security;
+        use atuin_common::secrets::RedactPattern;
+
+        let redact_patterns = patterns
+            .iter()
+            .map(|(pattern, replacement)| {
+                RedactPattern::with_replacement(
+                    regex::Regex::new(pattern).unwrap(),
+                    (*replacement).to_owned(),
+                )
+                .unwrap()
+            })
+            .collect();
+        Settings {
+            security: Security {
+                redact_patterns,
+                ..Security::default()
+            },
+            ..Settings::utc()
+        }
+    }
+
+    /// What is stored is the command as the user's patterns rewrite it, and nothing else about it
+    /// changes.
+    #[rstest]
+    #[tokio::test]
+    async fn the_users_replacements_rewrite_what_is_stored(#[future] db: Sqlite) {
+        let db = db.await;
+        let settings = redacting(&[(r"(--password=)\S+", "${1}<PASSWORD>")]);
+
+        let h = make_starting_history(&settings, "mysql --password=hunter2 db", None, None, None)
+            .unwrap();
+        assert_eq!(h.command, "mysql --password=<PASSWORD> db");
+        assert_eq!(h.cwd, utils::get_current_dir());
+        handle_start(&db, &h).await;
+
+        let stored = db.load(h.id).await.unwrap().unwrap();
+        assert_eq!(stored.command, "mysql --password=<PASSWORD> db");
+        assert_eq!(stored.timestamp, h.timestamp);
+        assert_eq!(stored.session, h.session);
+        assert_eq!(stored.cmd_origin, h.cmd_origin);
+        assert_eq!(stored.cwd, h.cwd);
+    }
+
+    /// `secrets_filter` judges the command as it would be stored: a credential the user's
+    /// patterns replace no longer keeps it out; one they leave still does.
+    #[rstest]
+    #[case::replaced(&[(r"ghp_\w+", "$$GITHUB_TOKEN")], Some("gh auth login --with-token $GITHUB_TOKEN"))]
+    #[case::left(&[(r"glpat-\w+", "$$GITLAB_TOKEN")], None)]
+    #[case::no_patterns(&[], None)]
+    fn secrets_filter_judges_the_redacted_command(
+        #[case] patterns: &[(&str, &str)],
+        #[case] kept: Option<&str>,
+    ) {
+        let settings = redacting(patterns);
+        let command = "gh auth login --with-token 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";
+        let h = make_starting_history(&settings, command, None, None, None);
+        assert_eq!(h.map(|h| h.command).as_deref(), kept);
+    }
+
+    /// `history_filter` keeps a command out whether it matches what was typed or what would be
+    /// stored, and so does a leading space.
+    #[rstest]
+    #[case::typed("^mysql", "mysql --password=hunter2")]
+    #[case::stored("<PASSWORD>", "mysql --password=hunter2")]
+    #[case::leading_space("^$", " mysql --password=hunter2")]
+    fn history_filter_sees_both_commands(#[case] filter: &str, #[case] command: &str) {
+        let settings = Settings {
+            history_filter: regex::RegexSet::new([filter]).unwrap(),
+            ..redacting(&[(r"(--password=)\S+", "${1}<PASSWORD>"), (r"^\s+", "")])
+        };
+        assert!(make_starting_history(&settings, command, None, None, None).is_none());
     }
 
     #[rstest]

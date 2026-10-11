@@ -2291,6 +2291,44 @@ mod tests {
         assert!(Settings::validate_str("[security]\nredact_patterns = [\"(\"]\n").is_err());
     }
 
+    /// A pattern can come with its own replacement, alongside plain ones, in the order given; the
+    /// replacement applies to commands as history keeps them.
+    #[rstest]
+    fn redact_patterns_take_replacements() {
+        let settings = parse_settings(concat!(
+            "[security]\n",
+            "redact_patterns = [\n",
+            "  \"ACME-[0-9]{6}\",\n",
+            "  { pattern = '(\\s-u\\s+)\\S+', replacement = '${1}$$USER' },\n",
+            "  { pattern = '(\\s-p\\s+)\\S+', replacement = '${1}$$PASS' },\n",
+            "]\n",
+        ));
+        assert_eq!(settings.security.redact_patterns.len(), 3);
+        assert_eq!(
+            settings.security.redact_command("netexec smb host -u alice -p hunter2 ACME-123456"),
+            Some("netexec smb host -u $USER -p $PASS ****".into())
+        );
+    }
+
+    #[rstest]
+    #[case::unknown_group("{ pattern = '(-u )\\S+', replacement = '${1}$USER' }", "group `USER`")]
+    #[case::invalid_regex("{ pattern = '(', replacement = 'x' }", "redact_patterns[0]")]
+    #[case::missing_replacement("{ pattern = 'x' }", "a regular expression, or a table")]
+    #[case::misspelt_key("{ pattern = 'x', replace = 'y' }", "a regular expression, or a table")]
+    fn redact_patterns_reject_a_broken_replacement(#[case] entry: &str, #[case] error: &str) {
+        let err = Settings::validate_str(&format!("[security]\nredact_patterns = [{entry}]\n"))
+            .unwrap_err();
+        assert!(format!("{err:#}").contains(error), "{err:#}");
+    }
+
+    /// The built-in patterns don't rewrite commands: one they recognise is not kept at all.
+    #[rstest]
+    fn redact_command_applies_only_the_users_patterns() {
+        let settings = parse_settings("");
+        let command = "export GITHUB_TOKEN=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";
+        assert_eq!(settings.security.redact_command(command), Some(command.into()));
+    }
+
     #[rstest]
     fn sync_frequency_accepts_humantime_and_bare_seconds() {
         let secs = std::time::Duration::from_secs;
